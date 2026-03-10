@@ -50,6 +50,29 @@
 
     </div>
 
+    <!--
+        Osoitehaku ja reititys:
+        - Käyttäjä kirjoittaa osoitteen tai paikan nimen kenttään
+        - Nominatim (OpenStreetMapin ilmainen geokooderi) muuntaa sen koordinaateiksi
+        - OSRM (ilmainen reitityspalvelu) laskee kävelyohjeet sijainnista kohteeseen
+        - Kumpikaan palvelu ei vaadi API-avainta - molemmat käyttävät OSM-dataa
+    -->
+    <div class="route-search">
+        <input
+            type="text"
+            id="addressInput"
+            placeholder="Kirjoita osoite tai kohde (esim. Kauppatori, Helsinki)..."
+            autocomplete="off"
+        />
+        <!-- Painikerivi: haku ja reitin poisto rinnakkain -->
+        <div class="route-btn-row">
+            <!-- Hakupainike: käynnistää Nominatim-haun ja sen jälkeen OSRM-reitityksen -->
+            <button id="addressSearchBtn">🗺️ Hae &amp; reititä</button>
+            <!-- Poistopainike: piilotettu kunnes reitti on piirretty -->
+            <button id="clearRouteBtn" class="clear-btn" style="display:none">✕ Poista reitti</button>
+        </div>
+    </div>
+
     <!-- Kartta-elementti, leaflet sitoo kartan tähän id:n perusteella -->
     <div id="map"></div>
 
@@ -69,6 +92,15 @@
             <ul id="wiki-links">Paikanna itsesi nähdäksesi lähialueen historiaa.</ul>
         </div>
 
+        <!-- Kortti 3: Kävelyohjeet OSRM:ltä - piilotettu kunnes reitti on laskettu -->
+        <div class="card route-card" id="route-card" style="display:none">
+            <h3>🚶 Kävelyohjeet</h3>
+            <!-- Tiivistelmä: matkan pituus ja arvioitu kävelyaika, täyttyy JavaScriptistä -->
+            <p id="route-info" class="route-summary"></p>
+            <!-- Askelkohtaiset käännekohtaohjeet - täyttyvät JavaScriptistä OSRM-vastauksen perusteella -->
+            <ul id="route-steps"></ul>
+        </div>
+
     </section>
 </div>
 
@@ -86,6 +118,8 @@
     let userMarker;
     let poiLayer;
     let currentCoords = null;
+    let routeLayer    = null; // Layer, johon OSRM-reitin viivapiirros piirretään kartalle
+    let addressMarker = null; // Markeri haetun osoitteen kohdepisteelle kartalla
 
     /*
         Funktio: initMap
@@ -231,9 +265,20 @@ document.getElementById('startBtn').addEventListener('click', () => {
                 li.style.animationDelay = `${index * 40}ms`;
                 list.appendChild(li);
 
-                // Luodaan markkeri kartalle ja liitetään siihen popup
+                // Luodaan markkeri kartalle
+                // Popupissa on kohteen nimen lisäksi "Kävele tähän" -painike
+                const popupEl = document.createElement('div');
+                popupEl.innerHTML = `<b>${name}</b><br><small>${type}</small>`;
+
+                // Painike sidotaan suoraan JS-viittauksella - ei inline-onclick-syntaksia
+                const walkBtn = document.createElement('button');
+                walkBtn.textContent = '🚶 Kävele tähän';
+                walkBtn.className = 'popup-walk-btn';
+                walkBtn.addEventListener('click', () => fetchRoute(el.lat, el.lon, name));
+                popupEl.appendChild(walkBtn);
+
                 const marker = L.marker([el.lat, el.lon]).addTo(poiLayer)
-                    .bindPopup(`<b>${name}</b><br>${type}`);
+                    .bindPopup(popupEl);
 
                 // Lisätään markkerille kevyt pulssianimaatio, jos ikoni on jo olemassa
                 marker.on('add', () => {
@@ -288,6 +333,188 @@ document.getElementById('startBtn').addEventListener('click', () => {
             console.error(e);
         }
     }
+
+    /*
+        OSRM-reititys: Hakee kävelyohjeet käyttäjän sijainnista valittuun kohteeseen.
+        - Käyttää project-osrm.org:n julkista, ilmaista "foot" (kävely) -API:a
+        - Ei vaadi API-avainta - käyttää samaa OpenStreetMap-dataa kuin muukin sovellus
+        - Piirtää reitin kartalle violettina polylinena
+        - Näyttää askelkohtaiset käännekohtaohjeet route-kortissa
+    */
+    async function fetchRoute(destLat, destLon, destName) {
+        if (!currentCoords) {
+            document.getElementById('status').textContent = "⚠️ Paikanna itsesi ensin, jotta reitti voidaan laskea!";
+            return;
+        }
+
+        const [startLat, startLon] = currentCoords;
+        const status = document.getElementById('status');
+        status.textContent = "🚶 Lasketaan kävelyreitti...";
+
+        // Tyhjennetään edellinen reitti kartalta ennen uuden piirtämistä
+        if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+
+        /*
+            OSRM foot -API-osoite:
+            - Koordinaatit muodossa: lon,lat;lon,lat  (longitude ENSIN - toisin kuin Leafletissä!)
+            - overview=full: koko reitin geometria yksityiskohtaisesti
+            - geometries=geojson: palauttaa GeoJSON-muodon, jonka Leaflet osaa piirtää suoraan
+            - steps=true: palauttaa askelkohtaiset käännekohtaohjeet
+        */
+        const url = `https://router.project-osrm.org/route/v1/foot/${startLon},${startLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
+
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+
+            if (data.code !== "Ok" || !data.routes || data.routes.length === 0) {
+                status.textContent = "Reititys epäonnistui. Yritä uudelleen.";
+                return;
+            }
+
+            const route      = data.routes[0];
+            const distanceKm = (route.distance / 1000).toFixed(1);
+            const durationMin = Math.ceil(route.duration / 60);
+
+            // Piirretään reitti kartalle suoraan GeoJSON-geometriasta
+            routeLayer = L.geoJSON(route.geometry, {
+                style: { color: '#6366f1', weight: 5, opacity: 0.85 }
+            }).addTo(map);
+
+            // Sovitetaan kartan näkymä automaattisesti reitin rajoihin
+            map.fitBounds(routeLayer.getBounds(), { padding: [40, 40] });
+
+            // Päivitetään statusteksti tiivistetyllä yhteenvedolla
+            status.textContent = `🚶 ${destName}: ${distanceKm} km · n. ${durationMin} min kävellen`;
+
+            // Täytetään route-kortti yhteenvedolla ja askelohjeilla
+            const routeCard  = document.getElementById('route-card');
+            const routeInfo  = document.getElementById('route-info');
+            const routeSteps = document.getElementById('route-steps');
+            const clearBtn   = document.getElementById('clearRouteBtn');
+
+            routeCard.style.display = '';
+            clearBtn.style.display  = '';
+            routeInfo.textContent   = `📏 ${distanceKm} km · 🕒 n. ${durationMin} min`;
+            routeSteps.innerHTML    = '';
+
+            // Käydään OSRM:n palauttamat askeleet läpi ja lisätään ne listaan
+            route.legs[0].steps.forEach((step, i) => {
+                const dist = step.distance < 1000
+                    ? `${Math.round(step.distance)} m`
+                    : `${(step.distance / 1000).toFixed(1)} km`;
+
+                const li = document.createElement('li');
+                li.classList.add('list-item-appear');
+                li.style.animationDelay = `${i * 30}ms`;
+
+                // Muunnetaan OSRM:n englanninkielinen maneuver suomeksi
+                const icon       = translateManeuver(step.maneuver.type, step.maneuver.modifier);
+                const streetName = step.name ? `· ${step.name}` : '';
+                li.textContent   = `${icon} ${streetName} (${dist})`.trim();
+                routeSteps.appendChild(li);
+            });
+
+        } catch (e) {
+            status.textContent = "Reitityshaku epäonnistui. Tarkista verkkoyhteys.";
+            console.error("OSRM error:", e);
+        }
+    }
+
+    /*
+        Nominatim-osoitehaku: muuntaa kirjoitetun osoitteen koordinaateiksi.
+        - Nominatim on OpenStreetMapin maksuton geokoodauspalvelu
+        - Ei vaadi API-avainta
+        - Kutsuu automaattisesti fetchRoute-funktiota osoitteen löydyttyä
+    */
+    async function searchAddress() {
+        const input = document.getElementById('addressInput').value.trim();
+        if (!input) return;
+
+        const status = document.getElementById('status');
+        status.textContent = "🔍 Haetaan osoitetta...";
+
+        // Nominatim geocoding: limit=1 palauttaa vain parhaiten täsmäävän tuloksen
+        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(input)}&format=json&limit=1`;
+
+        try {
+            const res = await fetch(url, {
+                headers: { 'Accept-Language': 'fi' } // Pyydetään suomenkieliset tulokset
+            });
+            const results = await res.json();
+
+            if (!results || results.length === 0) {
+                status.textContent = "Osoitetta ei löytynyt. Lisää kaupunki (esim. 'Kauppatori, Helsinki').";
+                return;
+            }
+
+            const place    = results[0];
+            const destLat  = parseFloat(place.lat);
+            const destLon  = parseFloat(place.lon);
+            // Käytetään lyhyttä nimeä: vain ensimmäinen osa pilkun edestä
+            const destName = place.display_name.split(',')[0];
+
+            // Poistetaan vanha osoitemarkeri ja lisätään uusi kohdepisteelle
+            if (addressMarker) map.removeLayer(addressMarker);
+            addressMarker = L.marker([destLat, destLon])
+                .addTo(map)
+                .bindPopup(`<b>${destName}</b><br><small>${place.display_name}</small>`)
+                .openPopup();
+
+            // Käynnistetään reititys automaattisesti löydettyyn kohteeseen
+            await fetchRoute(destLat, destLon, destName);
+
+        } catch (e) {
+            status.textContent = "Osoitehaku epäonnistui. Tarkista verkkoyhteys.";
+            console.error("Nominatim error:", e);
+        }
+    }
+
+    /*
+        Apufunktio: muuntaa OSRM:n englanninkieliset maneuver-tyypit
+        suomenkielisiksi emoji-ohjeiksi kävelyohjelistaa varten.
+    */
+    function translateManeuver(type, modifier) {
+        if (type === 'depart') return '▶ Aloita';
+        if (type === 'arrive') return '🏁 Perillä';
+        const turns = {
+            'left':         '↰ Vasemmalle',
+            'right':        '↱ Oikealle',
+            'slight left':  '↖ Hieman vasemmalle',
+            'slight right': '↗ Hieman oikealle',
+            'sharp left':   '⬅ Jyrkkä vasen',
+            'sharp right':  '➡ Jyrkkä oikea',
+            'uturn':        '↩ U-käännös',
+            'straight':     '⬆ Suoraan',
+        };
+        return turns[modifier] || '⬆ Jatka';
+    }
+
+    /*
+        Event-kuuntelijat osoitehaku- ja reittitoiminnoille:
+        - Haku käynnistyy sekä painikkeesta että Enter-näppäimellä
+        - "Poista reitti" tyhjentää reitin kartalta, piilottaa ohjekortin ja nollaa kentät
+    */
+    document.getElementById('addressSearchBtn').addEventListener('click', searchAddress);
+
+    // Enter-näppäin toimii samoin kuin hakupainike
+    document.getElementById('addressInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') searchAddress();
+    });
+
+    document.getElementById('clearRouteBtn').addEventListener('click', () => {
+        // Poistetaan reitti ja markeri kartalta
+        if (routeLayer)    { map.removeLayer(routeLayer);    routeLayer    = null; }
+        if (addressMarker) { map.removeLayer(addressMarker); addressMarker = null; }
+
+        // Piilotetaan ohjekortti ja "Poista reitti" -painike, tyhjennetään kentät
+        document.getElementById('route-card').style.display    = 'none';
+        document.getElementById('clearRouteBtn').style.display = 'none';
+        document.getElementById('route-steps').innerHTML       = '';
+        document.getElementById('route-info').textContent      = '';
+        document.getElementById('addressInput').value          = '';
+        document.getElementById('status').textContent          = 'Reitti poistettu.';
+    });
 
     /*  Dark mode -logiikka:*/
     const themeToggleBtn = document.getElementById('themeToggle');
