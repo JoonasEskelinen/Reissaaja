@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Reissaaja</title>
+    
+    <!-- Leafletin oma tyylitiedosto karttakomponenttia varten -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+
+        <!--  Dark mode -kytkin:  -->
+        <button id="themeToggle" class="theme-toggle" type="button">
+            🌙 Tumma tila
+        </button> 
+
+<div class="container">
+    <header>
+
+        <h1>Reissaaja</h1>
+        
+        <div id="status">Tervetuloa! Aloita paikannuksella.</div>
+    </header>
+
+    <div class="controls">
+        <!-- Paikannuspainike: käynnistää selaimen Geolocation-API:n -->
+        <button id="startBtn">Paikanna minut</button>
+
+        <!-- Valikko, josta käyttäjä valitsee haettavan kohteen tyypin-->
+<div class="input-group">
+    <label for="poiType">Mitä etsit?</label>
+    <select id="poiType">
+        <option value="" disabled selected hidden>Valitse kohde tästä... ▾</option>
+        <option value="restaurant">Ravintolat</option>
+        <option value="cafe">Kahvilat</option>
+        <option value="shop">Kaupat</option>
+        <option value="tourism">Nähtävyydet</option>
+        <option value="fuel">Huoltoasemat</option>
+    </select>
+</div>
+
+        <!-- Kohteiden hakupainike: aktivoituu vasta, kun sijainti on löytynyt -->
+        <button id="searchBtn" disabled>🔍 Etsi kohteita</button>
+
+
+    </div>
+
+    <!-- Kartta-elementti, leaflet sitoo kartan tähän id:n perusteella -->
+    <div id="map"></div>
+
+    <!-- Lähellä olevat paikat (Overpass API -tulokset) ja  Wikipedia-artikkelit (MediaWiki API -tulokset)-->
+    <section class="info-grid">
+        <!-- Kortti 1: Listaa Overpass API:n löytämät kiinnostavat kohteet -->
+        <div class="card">
+            <h3>Lähellä olevat paikat</h3>
+
+            <ul id="poi-list">Etsi kohteita painikkeella nähdäksesi ne tässä listassa.</ul>
+        </div>
+
+        <!-- Kortti 2: Listaa lähellä olevat Wikipedia-artikkelit -->
+        <div class="card">
+            <h3>Wikipedia-artikkelit</h3>
+
+            <ul id="wiki-links">Paikanna itsesi nähdäksesi lähialueen historiaa.</ul>
+        </div>
+
+    </section>
+</div>
+
+<!-- Leaflet-kirjaston JavaScript: tarvitaan kartan piirtämiseen ja markkereiden näyttämiseen -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+    /*
+        - map: Leaflet-karttaolion viittaus
+        - userMarker: käyttäjän sijainnin markkeri kartalla
+        - poiLayer: erillinen layer-ryhmä Overpass-kohteille
+        - currentCoords: tallennettu käyttäjän nykyinen sijainti muodossa
+    */
+    let map;
+    let userMarker;
+    let poiLayer;
+    let currentCoords = null;
+
+    /*
+        Funktio: initMap
+        - Vastaa kartan alustamisesta heti sivun latauduttua
+        - Kartta keskitetään oletuksena Helsinkiin (lat: 60.1699, lon: 24.9384)
+        - Lisätään OpenStreetMap-laattakartta sekä tyhjä layerGroup kohdemarkkereille
+    */
+    function initMap() {
+        // Luodaan Leaflet-kartta ja asetetaan alkuzoom sekä keskipiste
+        map = L.map('map').setView([60.1699, 24.9384], 13);
+
+        // Määritellään millaisia karttalaattoja käytetään (tässä OpenStreetMapin maksuton palvelu)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // POI-markkerit kerätään yhteen layerGroupiin, jotta ne voidaan tyhjentää helposti uuden haun yhteydessä
+        poiLayer = L.layerGroup().addTo(map);
+    }
+
+    // Kutsutaan karttaa heti skriptin suorittamisen yhteydessä
+    initMap();
+
+    /* käyttäjän sijainnin haku
+        - Käynnistyy, kun "Paikanna minut" -painiketta klikataan
+        - Päivittää tilaviestit, kartan keskipisteen ja markkerin
+        - Laukaisee myös Wikipedia-haun käyttäjän sijainnin ympärille
+    */
+document.getElementById('startBtn').addEventListener('click', () => {
+    const status = document.getElementById('status');
+    const searchBtn = document.getElementById('searchBtn');
+    const poiSelect = document.getElementById('poiType');
+    
+    status.textContent = "🌐 Etsitään sijaintia...";
+    status.style.color = "var(--primary)"; // Muutetaan väriä prosessin ajaksi
+
+    // Selaimen Geolocation-API hakee käyttäjän tämänhetkisen sijainnin
+    navigator.geolocation.getCurrentPosition((position) => {
+        // Otetaan käyttöön koordinaatit
+        const { latitude, longitude } = position.coords;
+        currentCoords = [latitude, longitude];
+
+        // Päivitetään statusteksti
+        status.textContent = `✅ Sijainti löytynyt! (Lat: ${latitude.toFixed(2)}, Lon: ${longitude.toFixed(2)})`;
+        status.style.color = "#10b981"; // Onnistumisen vihreä
+
+        // Aktivoidaan hakupainike ja lisätään sille huomio-efekti
+        searchBtn.disabled = false;
+        searchBtn.style.boxShadow = "0 0 15px rgba(99, 102, 241, 0.6)";
+        
+        // Ohjeistetaan käyttäjää valitsemaan kohde, jos hän ei ole vielä tehnyt niin
+        if (poiSelect.value === "") {
+            status.textContent = "✅ Sijainti löytyi! Valitse nyt 'Mitä etsit?' ja paina suurennuslasia.";
+        }
+
+        // Keskitetään kartta käyttäjän sijaintiin
+        map.setView(currentCoords, 15);
+        
+        // Poistetaan vanha merkki jos sellainen oli, ja lisätään uusi
+        if (userMarker) map.removeLayer(userMarker);
+        userMarker = L.marker(currentCoords).addTo(map)
+            .bindPopup("<b>Olet tässä!</b><br>Voit nyt etsiä kohteita ympäriltäsi.")
+            .openPopup();
+
+        // Käynnistetään Wikipedia-artikkelihaku automaattisesti
+        fetchWiki(latitude, longitude);
+
+    }, (err) => {
+        // Tarkempi virheen käsittely
+        let errorMsg = "Virhe: Sijaintia ei saatu.";
+        if (err.code === 1) errorMsg = "Virhe: Sijainnin käyttö estetty (anna lupa selaimen asetuksista).";
+        if (err.code === 3) errorMsg = "Virhe: Paikannus aikakatkaistiin. Yritä uudelleen.";
+        
+        status.textContent = errorMsg;
+        status.style.color = "#ef4444"; // Virheen punainen
+        console.error("Geolocation error:", err);
+    }, { 
+        enableHighAccuracy: true, // Pyydetään tarkinta mahdollista sijaintia (GPS)
+        timeout: 10000,           // Annetaan selaimelle 10 sekuntia aikaa paikantaa
+        maximumAge: 0             // Ei käytetä välimuistissa olevaa vanhaa sijaintia
+    });
+});
+
+    /*
+        Overpass API -kohteiden haku:
+        - aktivoituu kun käyttäjä klikkaa etsi kohteita -painiketta
+        - Rakentaa Overpass-kyselyn valitun tyypin esim kahvila tai ravintola
+        - Piirtää markkerit kartalle ja listaa nimet vasemmassa kortissa
+        - Lisää myös pienen sisääntuloanimaation listan riveille
+    */
+    document.getElementById('searchBtn').addEventListener('click', async () => {
+        // Jos sijaintia ei ole vielä haettu, ei voida hakea kohteita
+        if (!currentCoords) return;
+        
+        const type = document.getElementById('poiType').value;
+        const status = document.getElementById('status');
+        const list = document.getElementById('poi-list');
+        
+        // Päivitetään tilaviestiksi, mitä haetaan
+        status.textContent = `Haetaan kohteita (${type})...`;
+
+        // Tyhjennetään vanhat markkerit kartalta ja näytetään "Ladataan..." listassa
+        poiLayer.clearLayers();
+        list.innerHTML = "Ladataan...";
+
+        const [lat, lon] = currentCoords;
+
+        /*
+            Overpass-kysely: Haetaan valitun tyypin mukaisia hakuja kilometrin säteellä
+        */
+        const query = `[out:json];
+            node["amenity"="${type}"](around:1000,${lat},${lon});out;
+            node["shop"="${type}"](around:1000,${lat},${lon});out;
+            node["tourism"="${type}"](around:1000,${lat},${lon});out;
+            node["fuel"="${type}"](around:1000,${lat},${lon});out;`;
+
+        const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+            
+            // Jos tuloksia ei löydy lainkaan, kerrotaan siitä käyttäjälle
+            if (!data.elements || data.elements.length === 0) {
+                list.innerHTML = "Ei kohteita löytynyt tällä alueella.";
+                status.textContent = "Haku valmis, ei tuloksia.";
+                return;
+            }
+
+            // Tyhjennetään lista ennen uusien tulosten lisäämistä
+            list.innerHTML = "";
+
+            // Käydään jokainen Overpass-elementti läpi ja luodaan listaan yksi <li> ja kartalle yksi markkeri
+            data.elements.forEach((el, index) => {
+                const name = el.tags && el.tags.name ? el.tags.name : "Nimetön kohde";
+                
+                // Luodaan uusi listaelementti ja lisätään yksinkertainen animaatioluokka
+                const li = document.createElement('li');
+                li.textContent = name;
+                li.classList.add('list-item-appear');
+
+                // Pieni viive jokaiselle listaelementille peräkkäisen animaation luomiseksi
+                li.style.animationDelay = `${index * 40}ms`;
+                list.appendChild(li);
+
+                // Luodaan markkeri kartalle ja liitetään siihen popup
+                const marker = L.marker([el.lat, el.lon]).addTo(poiLayer)
+                    .bindPopup(`<b>${name}</b><br>${type}`);
+
+                // Lisätään markkerille kevyt pulssianimaatio, jos ikoni on jo olemassa
+                marker.on('add', () => {
+                    if (marker._icon) {
+                        marker._icon.classList.add('marker-pulse');
+                    }
+                });
+            });
+
+            status.textContent = `Löytyi ${data.elements.length} kohdetta!`;
+        } catch (e) {
+            // Jos Overpass-palvelu ei vastaa tai tulee virhe, kerrotaan siitä käyttäjälle
+            status.textContent = "Haku epäonnistui. Overpass-palvelu on ehkä varattu.";
+            console.error(e);
+        }
+    });
+
+    /*
+        MediaWiki (Wikipedia) -haku:
+        - Hakee lähellä olevia Wikipedia-artikkeleita käyttäjän sijainnin perusteella
+        - Tulokset näytetään listana, jokainen rivi on linkki Wikipediaan uuteen välilehteen
+    */
+    async function fetchWiki(lat, lon) {
+        // MediaWikin geosearch-kysely: hakee artikkeleita säteen sisällä
+        const url = `https://fi.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${lat}|${lon}&gsradius=5000&gslimit=10&format=json&origin=*`;
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+            const pages = data.query.geosearch;
+            const list = document.getElementById('wiki-links');
+
+            // Jos artikkeleita ei löydy, näytetään informatiivinen viesti
+            list.innerHTML = pages.length ? '' : 'Ei artikkeleita lähellä.';
+
+            // Luodaan linkkilista kaikista palautetuista Wikipedia-sivuista
+            pages.forEach((p, index) => {
+                const li = document.createElement('li');
+                li.classList.add('list-item-appear');
+                li.style.animationDelay = `${index * 40}ms`;
+
+                const a = document.createElement('a');
+                a.href = `https://fi.wikipedia.org/?curid=${p.pageid}`;
+                a.target = "_blank";
+                a.textContent = p.title;
+
+                li.appendChild(a);
+                list.appendChild(li);
+            });
+        } catch (e) {
+            // Jos haku epäonnistuu, virheilmoitus
+            document.getElementById('wiki-links').textContent = "Wiki-tietojen haku epäonnistui.";
+            console.error(e);
+        }
+    }
+
+    /*  Dark mode -logiikka:*/
+    const themeToggleBtn = document.getElementById('themeToggle');
+
+    themeToggleBtn.addEventListener('click', () => {
+        document.body.classList.toggle('dark');
+
+        // Tarkistetaan, onko dark-luokka nyt käytössä ja päivitetään napin teksti
+        const isDark = document.body.classList.contains('dark');
+        themeToggleBtn.textContent = isDark ? '☀️ Vaalea tila' : '🌙 Tumma tila';
+    });
+</script>
+
+</body>
+</html>
